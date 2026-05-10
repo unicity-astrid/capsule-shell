@@ -15,13 +15,11 @@ host_process = ["bash", "sh", "zsh"]
 
 [publish]
 "tool.v1.execute.*.result" = { wit = "@unicity-astrid/wit/types/tool-call-result" }
-# TODO: no canonical WIT type yet for tool describe response envelope
-"tool.v1.response.describe.*" = { wit = "TODO" }
+"tool.v1.response.describe.*" = { wit = "@unicity-astrid/wit/tool/describe-response" }
 
 [subscribe]
 "tool.v1.execute.run_shell_command" = { wit = "@unicity-astrid/wit/types/tool-call", handler = "tool_execute_run_shell_command" }
 "tool.v1.execute.spawn_background_process" = { wit = "@unicity-astrid/wit/types/tool-call", handler = "tool_execute_spawn_background_process" }
 "tool.v1.execute.read_process_logs" = { wit = "@unicity-astrid/wit/types/tool-call", handler = "tool_execute_read_process_logs" }
 "tool.v1.execute.kill_process" = { wit = "@unicity-astrid/wit/types/tool-call", handler = "tool_execute_kill_process" }
-# TODO: no canonical WIT type yet for tool describe request envelope
-"tool.v1.request.describe" = { wit = "TODO", handler = "tool_describe" }
+"tool.v1.request.describe" = { wit = "@unicity-astrid/wit/tool/describe-request", handler = "tool_describe" }
