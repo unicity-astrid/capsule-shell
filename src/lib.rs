@@ -34,9 +34,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 pub struct ShellTools {
     /// Live background process handles, keyed by the integer ID the
     /// LLM agent receives. Dropping a handle releases the kernel-side
-    /// process resource; we drop entries lazily on `kill_process` and
-    /// when `read_process_logs` observes the process has exited and
-    /// fully drained.
+    /// process resource. Entries are removed only by explicit
+    /// `kill_process` — `read_process_logs` reports exit state without
+    /// freeing the slot so the agent can drain final logs across
+    /// multiple reads before calling `kill_process` to release.
     background: Mutex<HashMap<u64, process::Process>>,
     /// Monotonic counter for assigning IDs to background processes.
     /// Per-capsule; capsules are reloaded with a fresh counter, which
@@ -481,9 +482,10 @@ impl ShellTools {
         let status = if logs.running {
             "running".to_string()
         } else {
-            match logs.exit.and_then(|e| e.exit_code) {
-                Some(code) => format!("exited with code {code}"),
-                None => "exited (unknown code)".to_string(),
+            match logs.exit.as_ref().map(|e| (e.exit_code, e.signal)) {
+                Some((Some(code), _)) => format!("exited with code {code}"),
+                Some((None, Some(sig))) => format!("killed by signal {sig}"),
+                Some((None, None)) | None => "exited (unknown termination)".to_string(),
             }
         };
 
@@ -529,9 +531,10 @@ impl ShellTools {
 
         let result = handle.kill()?;
 
-        let exit_info = match result.exit.and_then(|e| e.exit_code) {
-            Some(code) => format!("exit code {code}"),
-            None => "unknown exit code".to_string(),
+        let exit_info = match result.exit.as_ref().map(|e| (e.exit_code, e.signal)) {
+            Some((Some(code), _)) => format!("exit code {code}"),
+            Some((None, Some(sig))) => format!("killed by signal {sig}"),
+            Some((None, None)) | None => "unknown termination".to_string(),
         };
 
         let mut output = format!("Process {} killed ({exit_info}).\n", args.id);
