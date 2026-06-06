@@ -18,32 +18,18 @@
 use astrid_sdk::prelude::*;
 use astrid_sdk::schemars;
 use serde::Deserialize;
-use std::collections::HashMap;
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 /// The main entry point for the Shell Tools capsule.
 ///
-/// Holds a registry mapping integer IDs (returned to the LLM agent) to
-/// the live RAII `process::Process` handles. Tool calls are stateless
-/// invocations on a `&'static ShellTools`, but the post-PR#752 SDK
-/// expresses background processes as Drop-managed resources owned by
-/// the capsule. Storing handles here keeps them alive across tool
-/// calls while still giving the host the resource it needs to track.
+/// Stateless. Background processes live in the host-owned PERSISTENT process
+/// registry (`process::spawn_persistent`), keyed by an opaque `ProcessId` that
+/// survives instance-pool resets — so the capsule no longer stashes live
+/// handles across tool calls. The pre-persistent design held a
+/// `Mutex<HashMap<u64, process::Process>>`, which only worked because
+/// `host_process` capsules get the single-Store carve-out; reattaching by id
+/// removes that dependency.
 #[derive(Default)]
-pub struct ShellTools {
-    /// Live background process handles, keyed by the integer ID the
-    /// LLM agent receives. Dropping a handle releases the kernel-side
-    /// process resource. Entries are removed only by explicit
-    /// `kill_process` — `read_process_logs` reports exit state without
-    /// freeing the slot so the agent can drain final logs across
-    /// multiple reads before calling `kill_process` to release.
-    background: Mutex<HashMap<u64, process::Process>>,
-    /// Monotonic counter for assigning IDs to background processes.
-    /// Per-capsule; capsules are reloaded with a fresh counter, which
-    /// is fine — IDs only need to be unique within a capsule lifetime.
-    next_id: AtomicU64,
-}
+pub struct ShellTools;
 
 /// Input arguments for the `run_shell_command` tool.
 #[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
@@ -62,15 +48,15 @@ pub struct SpawnBackgroundArgs {
 /// Input arguments for the `read_process_logs` tool.
 #[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
 pub struct ReadProcessLogsArgs {
-    /// The process handle ID returned by `spawn_background_process`.
-    pub id: u64,
+    /// The process id returned by `spawn_background_process`.
+    pub id: String,
 }
 
 /// Input arguments for the `kill_process` tool.
 #[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
 pub struct KillProcessArgs {
-    /// The process handle ID returned by `spawn_background_process`.
-    pub id: u64,
+    /// The process id returned by `spawn_background_process`.
+    pub id: String,
 }
 
 /// Determine the safe subcommand depth for a given program.
@@ -442,19 +428,18 @@ impl ShellTools {
             )));
         }
 
-        // `Process` is a Drop-managed kernel resource — we stash it in the
-        // per-capsule registry so it stays alive across tool calls and the
-        // LLM can continue to address it by integer ID. Dropping the
-        // `Process` (on kill or final read) releases the kernel slot.
-        let handle = process::spawn_background("bash", &["-c", trimmed])?;
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let mut map = self
-            .background
-            .lock()
-            .map_err(|_| SysError::ApiError("background process registry lock poisoned".into()))?;
-        map.insert(id, handle);
+        // Spawn into the host-owned PERSISTENT registry. The returned
+        // `process-id` survives instance-pool resets, so a later
+        // `read_process_logs` / `kill_process` on a fresh pooled instance can
+        // reattach to it by id — no per-capsule handle map required.
+        let proc = process::Command::new("bash")
+            .arg("-c")
+            .arg(trimmed)
+            .label(trimmed)
+            .spawn_persistent()?;
         Ok(format!(
-            "Background process started with id: {id}. Use read_process_logs to check output and kill_process to stop it.",
+            "Background process started with id: {}. Use read_process_logs to check output and kill_process to stop it.",
+            proc.id()
         ))
     }
 
@@ -464,20 +449,11 @@ impl ShellTools {
     /// approval required — the process was already approved at spawn time.
     #[astrid::tool("read_process_logs")]
     pub fn read_process_logs(&self, args: ReadProcessLogsArgs) -> Result<String, SysError> {
-        // Look up the live `Process` handle in the registry; read_logs is a
-        // method on the resource in the post-PR#752 SDK.
-        let map = self
-            .background
-            .lock()
-            .map_err(|_| SysError::ApiError("background process registry lock poisoned".into()))?;
-        let handle = map.get(&args.id).ok_or_else(|| {
-            SysError::ApiError(format!(
-                "no background process with id {} (already killed or never started)",
-                args.id,
-            ))
-        })?;
-
-        let logs = handle.read_logs()?;
+        // Reattach to the persistent process by id and drain its logs. An
+        // unknown / reaped / not-ours id surfaces as a host `no-such-process`
+        // error.
+        let proc = process::attach(args.id.as_str());
+        let logs = proc.read_logs()?;
 
         let status = if logs.running {
             "running".to_string()
@@ -513,37 +489,29 @@ impl ShellTools {
     /// Releases the process handle slot. No additional approval required.
     #[astrid::tool("kill_process")]
     pub fn kill_process(&self, args: KillProcessArgs) -> Result<String, SysError> {
-        // Remove the handle from the registry up front so the kernel-side
-        // `process-handle` resource is dropped after we extract its final
-        // logs — that's what "releases the handle slot" means in the new
-        // resource-oriented model.
-        let handle = {
-            let mut map = self.background.lock().map_err(|_| {
-                SysError::ApiError("background process registry lock poisoned".into())
-            })?;
-            map.remove(&args.id).ok_or_else(|| {
-                SysError::ApiError(format!(
-                    "no background process with id {} (already killed or never started)",
-                    args.id,
-                ))
-            })?
-        };
+        // Reattach by id, drain any final buffered output, then `stop`
+        // (SIGTERM → grace → SIGKILL) — which reaps the id and frees the slot.
+        // `stop` returns only exit-info, so the final output must be drained
+        // BEFORE it.
+        let proc = process::attach(args.id.as_str());
+        let final_logs = proc.read_logs().ok();
+        let exit = proc.stop(None)?;
 
-        let result = handle.kill()?;
-
-        let exit_info = match result.exit.as_ref().map(|e| (e.exit_code, e.signal)) {
-            Some((Some(code), _)) => format!("exit code {code}"),
-            Some((None, Some(sig))) => format!("killed by signal {sig}"),
-            Some((None, None)) | None => "unknown termination".to_string(),
+        let exit_info = match (exit.exit_code, exit.signal) {
+            (Some(code), _) => format!("exit code {code}"),
+            (None, Some(sig)) => format!("killed by signal {sig}"),
+            (None, None) => "unknown termination".to_string(),
         };
 
         let mut output = format!("Process {} killed ({exit_info}).\n", args.id);
         use std::fmt::Write;
-        if !result.stdout.is_empty() {
-            let _ = write!(&mut output, "--- final stdout ---\n{}\n", result.stdout);
-        }
-        if !result.stderr.is_empty() {
-            let _ = write!(&mut output, "--- final stderr ---\n{}\n", result.stderr);
+        if let Some(logs) = final_logs {
+            if !logs.stdout.is_empty() {
+                let _ = write!(&mut output, "--- final stdout ---\n{}\n", logs.stdout);
+            }
+            if !logs.stderr.is_empty() {
+                let _ = write!(&mut output, "--- final stderr ---\n{}\n", logs.stderr);
+            }
         }
 
         // `handle` falls out of scope here and Drop releases the kernel slot.
